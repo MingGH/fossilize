@@ -4,6 +4,7 @@ import DetachedTimestampFile from 'javascript-opentimestamps/src/detached-timest
 import Context from 'javascript-opentimestamps/src/context.js'
 import Timestamp from 'javascript-opentimestamps/src/timestamp.js'
 import Ops from 'javascript-opentimestamps/src/ops.js'
+import Notary from 'javascript-opentimestamps/src/notary.js'
 import './App.css'
 
 const CORS_PROXY_PREFIX = 'https://proxy.onetool.app/proxy/'
@@ -326,12 +327,16 @@ type VerificationSuccess = {
   txUrl: string
 }
 
+type PendingProof = {
+  uri: string
+  msg: number[]
+}
+
 type UpgradeResult = {
   changed: boolean
   bitcoinCount: number
   pendingCount: number
   fileName: string
-  upgradedBytes?: Uint8Array
 }
 
 const collectNodes = (timestamp: any): TimestampNode[] => {
@@ -345,34 +350,26 @@ const collectNodes = (timestamp: any): TimestampNode[] => {
 const countBitcoinAttestations = (timestamp: any) =>
   collectNodes(timestamp).reduce(
     (count, node) =>
-      count + node.attestations.filter((attestation) => attestation.constructor?.name === 'BitcoinBlockHeaderAttestation').length,
+      count + node.attestations.filter((attestation) => attestation instanceof Notary.BitcoinBlockHeaderAttestation).length,
     0,
   )
 
-const proxiedUrl = (url: string) => `${CORS_PROXY_PREFIX}${url}`
+const collectPendingProofs = (timestamp: any): PendingProof[] =>
+  collectNodes(timestamp).flatMap((node) =>
+    node.attestations
+      .filter((attestation) => attestation instanceof Notary.PendingAttestation)
+      .map((attestation) => ({ uri: attestation.uri, msg: node.msg })),
+  )
 
-const findPendingSubStamps = (timestamp: any): { stamp: any; uri: string; msg: number[] }[] => {
-  const matches: { stamp: any; uri: string; msg: number[] }[] = []
-  for (const attestation of timestamp.attestations ?? []) {
-    if (attestation.constructor?.name === 'PendingAttestation') {
-      matches.push({ stamp: timestamp, uri: attestation.uri, msg: Array.from(timestamp.msg) })
-    }
-  }
-  if (timestamp.ops) {
-    timestamp.ops.forEach((child: any) => {
-      matches.push(...findPendingSubStamps(child))
-    })
-  }
-  return matches
-}
+const proxiedUrl = (url: string) => `${CORS_PROXY_PREFIX}${url}`
 
 const upgradeDetachedTimestamp = async (otsFile: File): Promise<UpgradeResult> => {
   const otsBytes = new Uint8Array(await otsFile.arrayBuffer())
   const detached = DetachedTimestampFile.deserialize(otsBytes)
   const beforeBitcoinCount = countBitcoinAttestations(detached.timestamp)
-  const pendingSubStamps = findPendingSubStamps(detached.timestamp)
+  const pendingProofs = collectPendingProofs(detached.timestamp)
 
-  if (pendingSubStamps.length === 0) {
+  if (pendingProofs.length === 0) {
     return {
       changed: false,
       bitcoinCount: beforeBitcoinCount,
@@ -381,7 +378,7 @@ const upgradeDetachedTimestamp = async (otsFile: File): Promise<UpgradeResult> =
     }
   }
 
-  for (const pending of pendingSubStamps) {
+  for (const pending of pendingProofs) {
     const url = `${pending.uri.replace(/\/$/, '')}/timestamp/${bytesToHex(pending.msg)}`
     const response = await fetch(proxiedUrl(url), {
       headers: { Accept: 'application/vnd.opentimestamps.v1' },
@@ -393,26 +390,24 @@ const upgradeDetachedTimestamp = async (otsFile: File): Promise<UpgradeResult> =
     const timestampBytes = new Uint8Array(await response.arrayBuffer())
     const upgradedTimestamp = Timestamp.deserialize(
       new Context.StreamDeserialization(timestampBytes),
-      pending.msg,
+      Array.from(pending.msg),
     )
-    pending.stamp.merge(upgradedTimestamp)
+    detached.timestamp.merge(upgradedTimestamp)
   }
 
   const bitcoinCount = countBitcoinAttestations(detached.timestamp)
   const changed = bitcoinCount > beforeBitcoinCount
-  const upgradedBytes = changed ? detached.serializeToBytes() : undefined
 
   if (changed) {
     const upgradedName = otsFile.name.replace(/\.ots$/i, '.upgraded.ots')
-    downloadBytes(upgradedBytes!, upgradedName)
+    downloadBytes(detached.serializeToBytes(), upgradedName)
   }
 
   return {
     changed,
     bitcoinCount,
-    pendingCount: pendingSubStamps.length,
+    pendingCount: pendingProofs.length,
     fileName: otsFile.name,
-    upgradedBytes,
   }
 }
 
@@ -462,7 +457,7 @@ async function verifyDetachedTimestamp(file: File, otsFile: File, onProgress: (p
   const nodes = collectNodes(detached.timestamp)
   const bitcoinNodes = nodes.flatMap((node) =>
     node.attestations
-      .filter((attestation) => attestation.constructor?.name === 'BitcoinBlockHeaderAttestation')
+      .filter((attestation) => attestation instanceof Notary.BitcoinBlockHeaderAttestation)
       .map((attestation) => ({ node, attestation })),
   )
 
@@ -507,23 +502,22 @@ async function verifyDetachedTimestamp(file: File, otsFile: File, onProgress: (p
 function VerifyTab() {
   const [file, setFile] = useState<File | null>(null)
   const [otsFile, setOtsFile] = useState<File | null>(null)
-  const [upgradedOtsFile, setUpgradedOtsFile] = useState<File | null>(null)
+  const [upgradeFile, setUpgradeFile] = useState<File | null>(null)
   const [progress, setProgress] = useState(0)
   const [result, setResult] = useState<VerificationSuccess | null>(null)
   const [upgradeResult, setUpgradeResult] = useState<UpgradeResult | null>(null)
   const [status, setStatus] = useState('上传原始文件和对应 .ots 文件后，将在本地完成校验。')
-  const [upgradeStatus, setUpgradeStatus] = useState('如果验证提示 pending，可点击升级 .ots，工具会自动调用 calendar 并把结果合并到内存中的 .ots，再继续验证。')
+  const [upgradeStatus, setUpgradeStatus] = useState('上传 pending .ots 后，可查询 calendar 是否已经补齐 Bitcoin 区块证明。')
   const [error, setError] = useState('')
   const [upgradeError, setUpgradeError] = useState('')
   const [busy, setBusy] = useState(false)
   const [upgradeBusy, setUpgradeBusy] = useState(false)
 
-  const activeOtsFile = upgradedOtsFile ?? otsFile
-  const canVerify = Boolean(file && activeOtsFile && !busy && !upgradeBusy)
-  const canUpgrade = Boolean(activeOtsFile && !upgradeBusy && !busy)
+  const canVerify = Boolean(file && otsFile && !busy)
+  const canUpgrade = Boolean(upgradeFile && !upgradeBusy)
 
   const verify = async () => {
-    if (!file || !activeOtsFile) return
+    if (!file || !otsFile) return
 
     setBusy(true)
     setError('')
@@ -532,7 +526,7 @@ function VerifyTab() {
     setStatus('正在重新计算文件摘要并解析证明。')
 
     try {
-      const verification = await verifyDetachedTimestamp(file, activeOtsFile, setProgress)
+      const verification = await verifyDetachedTimestamp(file, otsFile, setProgress)
       setResult(verification)
       setStatus('验证通过，证明与链上记录一致。')
     } catch (reason) {
@@ -544,7 +538,7 @@ function VerifyTab() {
   }
 
   const upgrade = async () => {
-    if (!activeOtsFile) return
+    if (!upgradeFile) return
 
     setUpgradeBusy(true)
     setUpgradeError('')
@@ -552,21 +546,15 @@ function VerifyTab() {
     setUpgradeStatus('正在查询 OpenTimestamps calendar。')
 
     try {
-      const upgraded = await upgradeDetachedTimestamp(activeOtsFile)
+      const upgraded = await upgradeDetachedTimestamp(upgradeFile)
       setUpgradeResult(upgraded)
-      if (upgraded.changed && upgraded.upgradedBytes) {
-        const upgradedFile = new File(
-          [toArrayBuffer(upgraded.upgradedBytes)],
-          activeOtsFile.name.replace(/\.ots$/i, '.upgraded.ots'),
-          { type: 'application/octet-stream' },
-        )
-        setUpgradedOtsFile(upgradedFile)
-        setUpgradeStatus('升级成功，新的 .ots 已合并到当前证明，可直接点击开始验证。')
-      } else if (upgraded.bitcoinCount > 0) {
-        setUpgradeStatus('该 .ots 已经包含 Bitcoin 区块证明，无需升级。')
-      } else {
-        setUpgradeStatus('暂未查询到 Bitcoin 区块证明，请稍后再试。')
-      }
+      setUpgradeStatus(
+        upgraded.changed
+          ? '升级成功，新的 .ots 文件已开始下载。'
+          : upgraded.bitcoinCount > 0
+            ? '该 .ots 已经包含 Bitcoin 区块证明，无需升级。'
+            : '暂未查询到 Bitcoin 区块证明，请稍后再试。',
+      )
     } catch (reason) {
       setUpgradeError(reason instanceof Error ? reason.message : '升级失败')
       setUpgradeStatus('升级未完成。')
@@ -585,21 +573,10 @@ function VerifyTab() {
         <p>校验原始文件摘要与链上记录，或对 pending .ots 进行升级。</p>
       </div>
 
-      <div className="grid">
+      <div className="grid grid-col-3">
         <DropZone label="原始文件" description="选择需要核验的原文件" icon="file" file={file} onFile={setFile} />
-        <DropZone
-          label="存证文件"
-          description="选择对应的 .ots 文件"
-          icon="shield"
-          accept=".ots"
-          file={activeOtsFile}
-          onFile={(picked) => {
-            setOtsFile(picked)
-            setUpgradedOtsFile(null)
-            setUpgradeResult(null)
-            setUpgradeError('')
-          }}
-        />
+        <DropZone label="存证文件" description="选择对应的 .ots 文件" icon="shield" accept=".ots" file={otsFile} onFile={setOtsFile} />
+        <DropZone label="升级 .ots" description="上传待升级的 pending .ots" icon="download" accept=".ots" file={upgradeFile} onFile={setUpgradeFile} />
       </div>
 
       <div className="button-group">
@@ -707,7 +684,7 @@ function App() {
           </button>
           <button className={tab === 'verify' ? 'active' : ''} type="button" onClick={() => setTab('verify')}>
             <Icon name="verify" />
-            <span>验证 / 升级</span>
+            <span>验证证明</span>
           </button>
         </nav>
 
