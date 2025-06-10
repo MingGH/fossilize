@@ -330,6 +330,7 @@ type VerificationSuccess = {
 type PendingProof = {
   uri: string
   msg: number[]
+  timestamp: any  // reference to the actual Timestamp node for merging
 }
 
 type UpgradeResult = {
@@ -337,6 +338,7 @@ type UpgradeResult = {
   bitcoinCount: number
   pendingCount: number
   fileName: string
+  detached?: any  // upgraded DetachedTimestampFile kept in memory
 }
 
 const collectNodes = (timestamp: any): TimestampNode[] => {
@@ -354,12 +356,20 @@ const countBitcoinAttestations = (timestamp: any) =>
     0,
   )
 
-const collectPendingProofs = (timestamp: any): PendingProof[] =>
-  collectNodes(timestamp).flatMap((node) =>
-    node.attestations
-      .filter((attestation) => attestation instanceof Notary.PendingAttestation)
-      .map((attestation) => ({ uri: attestation.uri, msg: node.msg })),
-  )
+const collectPendingProofsFromTimestamp = (timestamp: any): PendingProof[] => {
+  const results: PendingProof[] = []
+  for (const att of (timestamp.attestations ?? [])) {
+    if (att instanceof Notary.PendingAttestation) {
+      results.push({ uri: att.uri, msg: Array.from(timestamp.msg), timestamp })
+    }
+  }
+  if (timestamp.ops) {
+    timestamp.ops.forEach((child: any) => {
+      results.push(...collectPendingProofsFromTimestamp(child))
+    })
+  }
+  return results
+}
 
 const proxiedUrl = (url: string) => `${CORS_PROXY_PREFIX}${url}`
 
@@ -367,7 +377,7 @@ const upgradeDetachedTimestamp = async (otsFile: File): Promise<UpgradeResult> =
   const otsBytes = new Uint8Array(await otsFile.arrayBuffer())
   const detached = DetachedTimestampFile.deserialize(otsBytes)
   const beforeBitcoinCount = countBitcoinAttestations(detached.timestamp)
-  const pendingProofs = collectPendingProofs(detached.timestamp)
+  const pendingProofs = collectPendingProofsFromTimestamp(detached.timestamp)
 
   if (pendingProofs.length === 0) {
     return {
@@ -392,7 +402,7 @@ const upgradeDetachedTimestamp = async (otsFile: File): Promise<UpgradeResult> =
       new Context.StreamDeserialization(timestampBytes),
       Array.from(pending.msg),
     )
-    detached.timestamp.merge(upgradedTimestamp)
+    pending.timestamp.merge(upgradedTimestamp)
   }
 
   const bitcoinCount = countBitcoinAttestations(detached.timestamp)
@@ -408,6 +418,7 @@ const upgradeDetachedTimestamp = async (otsFile: File): Promise<UpgradeResult> =
     bitcoinCount,
     pendingCount: pendingProofs.length,
     fileName: otsFile.name,
+    detached,
   }
 }
 
@@ -502,19 +513,19 @@ async function verifyDetachedTimestamp(file: File, otsFile: File, onProgress: (p
 function VerifyTab() {
   const [file, setFile] = useState<File | null>(null)
   const [otsFile, setOtsFile] = useState<File | null>(null)
-  const [upgradeFile, setUpgradeFile] = useState<File | null>(null)
+  const [upgradedDetached, setUpgradedDetached] = useState<any>(null)
   const [progress, setProgress] = useState(0)
   const [result, setResult] = useState<VerificationSuccess | null>(null)
   const [upgradeResult, setUpgradeResult] = useState<UpgradeResult | null>(null)
   const [status, setStatus] = useState('上传原始文件和对应 .ots 文件后，将在本地完成校验。')
-  const [upgradeStatus, setUpgradeStatus] = useState('上传 pending .ots 后，可查询 calendar 是否已经补齐 Bitcoin 区块证明。')
+  const [upgradeStatus, setUpgradeStatus] = useState('如果验证提示 pending，可点击升级 .ots，工具会自动调用 calendar 并把结果合并到内存中的 .ots，再继续验证。')
   const [error, setError] = useState('')
   const [upgradeError, setUpgradeError] = useState('')
   const [busy, setBusy] = useState(false)
   const [upgradeBusy, setUpgradeBusy] = useState(false)
 
   const canVerify = Boolean(file && otsFile && !busy)
-  const canUpgrade = Boolean(upgradeFile && !upgradeBusy)
+  const canUpgrade = Boolean(otsFile && !upgradeBusy)
 
   const verify = async () => {
     if (!file || !otsFile) return
@@ -526,9 +537,63 @@ function VerifyTab() {
     setStatus('正在重新计算文件摘要并解析证明。')
 
     try {
-      const verification = await verifyDetachedTimestamp(file, otsFile, setProgress)
-      setResult(verification)
-      setStatus('验证通过，证明与链上记录一致。')
+      // If we have an upgraded detached in memory, use it directly
+      if (upgradedDetached) {
+        const digest = await hashFile(file, setProgress)
+        if (!equalBytes(upgradedDetached.fileDigest(), digest.bytes)) {
+          throw new Error('原始文件 SHA-256 与 .ots 文件中记录的摘要不匹配')
+        }
+
+        const nodes = collectNodes(upgradedDetached.timestamp)
+        const bitcoinNodes = nodes.flatMap((node) =>
+          node.attestations
+            .filter((attestation) => attestation instanceof Notary.BitcoinBlockHeaderAttestation)
+            .map((attestation) => ({ node, attestation })),
+        )
+
+        if (bitcoinNodes.length === 0) {
+          throw new Error('该 .ots 尚未包含 Bitcoin 区块证明，可能仍是 PendingAttestation，请稍后升级后再验证')
+        }
+
+        const { node, attestation } = bitcoinNodes.sort((a, b) => a.attestation.height - b.attestation.height)[0]
+        const tx = await findTxForHeight(nodes, attestation.height)
+
+        if (!verifyOpReturn(tx, nodes)) {
+          throw new Error('交易 OP_RETURN 与 .ots 证明路径中的承诺不匹配')
+        }
+
+        const blockHash = tx.status?.block_hash
+        if (!blockHash) throw new Error('blockstream 交易响应缺少区块哈希')
+
+        const blockResponse = await fetch(`${BLOCKSTREAM_API}/block/${blockHash}`)
+        if (!blockResponse.ok) throw new Error(`blockstream 区块查询失败：HTTP ${blockResponse.status}`)
+
+        const block = (await blockResponse.json()) as BlockResponse
+        const expectedMerkleRoot = bytesToHex(reverseBytes(node.msg))
+
+        if (block.height !== attestation.height) {
+          throw new Error('区块高度与 .ots 证明中的 Bitcoin attestation 不匹配')
+        }
+
+        if (block.merkle_root !== expectedMerkleRoot) {
+          throw new Error('区块 merkle_root 与 .ots 执行结果不匹配')
+        }
+
+        const verification = {
+          height: block.height,
+          time: new Date(block.timestamp * 1000).toLocaleString(),
+          blockHash,
+          blockUrl: `https://blockstream.info/block/${blockHash}`,
+          txid: tx.txid,
+          txUrl: `https://blockstream.info/tx/${tx.txid}`,
+        } satisfies VerificationSuccess
+        setResult(verification)
+        setStatus('验证通过，证明与链上记录一致。')
+      } else {
+        const verification = await verifyDetachedTimestamp(file, otsFile, setProgress)
+        setResult(verification)
+        setStatus('验证通过，证明与链上记录一致。')
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '验证失败')
       setStatus('验证未通过。')
@@ -538,7 +603,7 @@ function VerifyTab() {
   }
 
   const upgrade = async () => {
-    if (!upgradeFile) return
+    if (!otsFile) return
 
     setUpgradeBusy(true)
     setUpgradeError('')
@@ -546,15 +611,16 @@ function VerifyTab() {
     setUpgradeStatus('正在查询 OpenTimestamps calendar。')
 
     try {
-      const upgraded = await upgradeDetachedTimestamp(upgradeFile)
+      const upgraded = await upgradeDetachedTimestamp(otsFile)
       setUpgradeResult(upgraded)
-      setUpgradeStatus(
-        upgraded.changed
-          ? '升级成功，新的 .ots 文件已开始下载。'
-          : upgraded.bitcoinCount > 0
-            ? '该 .ots 已经包含 Bitcoin 区块证明，无需升级。'
-            : '暂未查询到 Bitcoin 区块证明，请稍后再试。',
-      )
+      if (upgraded.changed && upgraded.detached) {
+        setUpgradedDetached(upgraded.detached)
+        setUpgradeStatus('✅ 升级成功，新的 .ots 已合并到当前证明，可直接点击开始验证。')
+      } else if (upgraded.bitcoinCount > 0) {
+        setUpgradeStatus('该 .ots 已经包含 Bitcoin 区块证明，无需升级。')
+      } else {
+        setUpgradeStatus('暂未查询到 Bitcoin 区块证明，请稍后再试。')
+      }
     } catch (reason) {
       setUpgradeError(reason instanceof Error ? reason.message : '升级失败')
       setUpgradeStatus('升级未完成。')
@@ -573,10 +639,9 @@ function VerifyTab() {
         <p>校验原始文件摘要与链上记录，或对 pending .ots 进行升级。</p>
       </div>
 
-      <div className="grid grid-col-3">
+      <div className="grid">
         <DropZone label="原始文件" description="选择需要核验的原文件" icon="file" file={file} onFile={setFile} />
-        <DropZone label="存证文件" description="选择对应的 .ots 文件" icon="shield" accept=".ots" file={otsFile} onFile={setOtsFile} />
-        <DropZone label="升级 .ots" description="上传待升级的 pending .ots" icon="download" accept=".ots" file={upgradeFile} onFile={setUpgradeFile} />
+        <DropZone label="存证文件" description="选择对应的 .ots 文件" icon="shield" accept=".ots" file={otsFile} onFile={(f) => { setOtsFile(f); setUpgradedDetached(null); setResult(null); setUpgradeResult(null); setError(''); setUpgradeError('') }} />
       </div>
 
       <div className="button-group">
@@ -596,7 +661,7 @@ function VerifyTab() {
           {error && <p className="error">{error}</p>}
         </div>
         <div>
-          <p className="status">{upgradeStatus}</p>
+          <p className={`status${upgradedDetached ? ' success' : ''}`}>{upgradeStatus}</p>
           {upgradeError && <p className="error">{upgradeError}</p>}
         </div>
       </div>

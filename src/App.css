@@ -318,6 +318,11 @@
   line-height: 1.55;
 }
 
+.status.success {
+  color: #16a34a;
+  font-weight: 600;
+}
+
 .progress-wrap {
   display: grid;
   gap: 10px;
