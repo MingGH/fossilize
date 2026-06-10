@@ -2,6 +2,9 @@
 
 基于 [OpenTimestamps](https://opentimestamps.org/) 协议的浏览器端文件存证工具。为任意文件生成可独立验证的存在性证明（.ots），证明锚定在 Bitcoin 区块链上。
 
+<img width="1291" height="720" alt="image" src="https://github.com/user-attachments/assets/c248d7a5-f7e9-4e55-8017-5fb01a9f66d3" />
+
+
 ## 特性
 
 - **本地计算** — 文件始终保留在浏览器内，仅将 SHA-256 摘要提交到 OpenTimestamps calendar
