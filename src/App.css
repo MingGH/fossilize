@@ -565,3 +565,26 @@
     font-size: 21px;
   }
 }
+
+.site-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 32px;
+  padding: 18px 0;
+  color: #667085;
+  font-size: 14px;
+  border-top: 1px solid rgba(29, 41, 57, 0.1);
+}
+
+.site-footer a {
+  color: #7a5c2e;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.site-footer a:hover {
+  text-decoration: underline;
+}

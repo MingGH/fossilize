@@ -755,6 +755,13 @@ function App() {
 
         {tab === 'notarize' ? <NotarizeTab /> : <VerifyTab />}
       </section>
+
+      <footer className="site-footer">
+        <span></span>
+        <a href="https://www.runnable.run/about" target="_blank" rel="noreferrer">Asher的博客</a>
+        <a href="https://996.ninja/" target="_blank" rel="noreferrer">996忍者</a>
+        <a href="https://github.com/MingGH/fossilize" target="_blank" rel="noreferrer">GitHub 源码</a>
+      </footer>
     </main>
   )
 }
