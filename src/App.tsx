@@ -186,6 +186,18 @@ function ProgressBar({ value }: { value: number }) {
   )
 }
 
+function LoadingOverlay({ message }: { message: string }) {
+  return (
+    <div className="loading-overlay">
+      <div className="loading-content">
+        <div className="loading-spinner" />
+        <p className="loading-message">{message}</p>
+        <p className="loading-hint">正在与区块链网络通信，可能需要多次请求，请耐心等待…</p>
+      </div>
+    </div>
+  )
+}
+
 function NotarizeTab() {
   const [file, setFile] = useState<File | null>(null)
   const [hash, setHash] = useState('')
@@ -422,12 +434,18 @@ const upgradeDetachedTimestamp = async (otsFile: File): Promise<UpgradeResult> =
   }
 }
 
-const findTxForHeight = async (nodes: TimestampNode[], height: number) => {
+const findTxForHeight = async (
+  nodes: TimestampNode[],
+  height: number,
+  onStep?: (current: number, total: number) => void,
+) => {
   const candidates = nodes
     .map((node) => new Uint8Array(node.msg))
     .filter((msg) => msg.length > 60 && msg.length < 4096)
 
-  for (const rawTx of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    onStep?.(i + 1, candidates.length)
+    const rawTx = candidates[i]
     const txid = bytesToHex(reverseBytes(sha256(sha256(rawTx))))
     const response = await fetch(`${BLOCKSTREAM_API}/tx/${txid}`)
     if (!response.ok) continue
@@ -456,7 +474,12 @@ const verifyOpReturn = (tx: TxResponse, nodes: TimestampNode[]) => {
   })
 }
 
-async function verifyDetachedTimestamp(file: File, otsFile: File, onProgress: (progress: number) => void) {
+async function verifyDetachedTimestamp(
+  file: File,
+  otsFile: File,
+  onProgress: (progress: number) => void,
+  onStep?: (current: number, total: number) => void,
+) {
   const digest = await hashFile(file, onProgress)
   const otsBytes = new Uint8Array(await otsFile.arrayBuffer())
   const detached = DetachedTimestampFile.deserialize(otsBytes)
@@ -477,7 +500,7 @@ async function verifyDetachedTimestamp(file: File, otsFile: File, onProgress: (p
   }
 
   const { node, attestation } = bitcoinNodes.sort((a, b) => a.attestation.height - b.attestation.height)[0]
-  const tx = await findTxForHeight(nodes, attestation.height)
+  const tx = await findTxForHeight(nodes, attestation.height, onStep)
 
   if (!verifyOpReturn(tx, nodes)) {
     throw new Error('交易 OP_RETURN 与 .ots 证明路径中的承诺不匹配')
@@ -536,6 +559,10 @@ function VerifyTab() {
     setProgress(0)
     setStatus('正在重新计算文件摘要并解析证明。')
 
+    const onStep = (current: number, total: number) => {
+      setStatus(`正在查询 Blockstream 网络验证交易（${current}/${total}）…`)
+    }
+
     try {
       // If we have an upgraded detached in memory, use it directly
       if (upgradedDetached) {
@@ -555,8 +582,9 @@ function VerifyTab() {
           throw new Error('该 .ots 尚未包含 Bitcoin 区块证明，可能仍是 PendingAttestation，请稍后升级后再验证')
         }
 
+        setStatus('正在查询 Blockstream 网络定位交易…')
         const { node, attestation } = bitcoinNodes.sort((a, b) => a.attestation.height - b.attestation.height)[0]
-        const tx = await findTxForHeight(nodes, attestation.height)
+        const tx = await findTxForHeight(nodes, attestation.height, onStep)
 
         if (!verifyOpReturn(tx, nodes)) {
           throw new Error('交易 OP_RETURN 与 .ots 证明路径中的承诺不匹配')
@@ -565,6 +593,7 @@ function VerifyTab() {
         const blockHash = tx.status?.block_hash
         if (!blockHash) throw new Error('blockstream 交易响应缺少区块哈希')
 
+        setStatus('正在查询区块信息…')
         const blockResponse = await fetch(`${BLOCKSTREAM_API}/block/${blockHash}`)
         if (!blockResponse.ok) throw new Error(`blockstream 区块查询失败：HTTP ${blockResponse.status}`)
 
@@ -590,7 +619,7 @@ function VerifyTab() {
         setResult(verification)
         setStatus('验证通过，证明与链上记录一致。')
       } else {
-        const verification = await verifyDetachedTimestamp(file, otsFile, setProgress)
+        const verification = await verifyDetachedTimestamp(file, otsFile, setProgress, onStep)
         setResult(verification)
         setStatus('验证通过，证明与链上记录一致。')
       }
@@ -630,7 +659,10 @@ function VerifyTab() {
   }
 
   return (
-    <section className="work-card">
+    <section className="work-card" style={{ position: 'relative' }}>
+      {busy && <LoadingOverlay message={status} />}
+      {upgradeBusy && <LoadingOverlay message={upgradeStatus} />}
+
       <div className="section-heading">
         <div>
           <span className="section-kicker">Verification</span>
